@@ -2,15 +2,11 @@
 
 Status: Proposed for phased execution
 
-Scope: `querymate-dab` only; no application implementation is part of this document
+Scope: QueryMate Data API Builder (DAB) and SQL Server planning only. This document does not implement the application.
 
-Last reviewed: 2026-09-12
+## 1. Goal
 
-## 1. Purpose and target outcome
-
-This plan defines how to build and validate the QueryMate Data API Builder (DAB) and SQL Server layer as an independently runnable, read-only data access service. It is intentionally detailed enough to execute one phase at a time while leaving Spring Boot, Spring AI, and Angular implementation for separate plans.
-
-The target flow is:
+Build a small, independently runnable, read-only DAB layer that can later be used by the QueryMate backend through MCP and/or GraphQL.
 
 ```text
 Future QueryMate backend / Spring AI
@@ -19,695 +15,419 @@ Future QueryMate backend / Spring AI
                 |
         Microsoft Data API Builder
                 |
-     least-privileged SQL Server user
+       read-only SQL Server user
                 |
              SQL Server
 ```
 
-The following decisions are non-negotiable unless an architecture review changes them:
+The POC should be simple. Add structure only when the current solution becomes difficult to maintain. Production concerns are recorded so the design does not create a dead end, but production infrastructure will not be built during the POC without a concrete need.
 
-- DAB and its SQL Server account are read-only.
-- An AI caller never receives an arbitrary-SQL capability.
-- Every exposed entity, field, relationship, and permission is explicit and reviewed.
-- Schema discovery produces candidates; it never publishes configuration automatically.
-- SQL Server and DAB assets remain under `querymate-dab`.
-- Angular uses Node tooling, the backend uses Maven, and DAB uses its CLI/container; neither Angular nor DAB becomes an artificial Maven module.
-- DAB is tested and trusted independently before backend integration.
+## 2. Agreed architecture
 
-## 2. Review of the proposed approach
+- DAB is read-only, and its SQL Server account is also read-only.
+- The future AI/backend cannot send arbitrary SQL.
+- Only explicitly reviewed entities, fields, relationships, and permissions are exposed.
+- Schema discovery produces candidates for human review; it never changes approved DAB configuration automatically.
+- DAB remains independently runnable from Spring Boot.
+- Angular uses Node, Spring Boot uses Maven, and DAB uses the DAB CLI/container.
+- Sensitive tables and fields are excluded by explicit review.
+- Foreign keys are the primary source for relationships. Missing business relationships are flagged, not invented.
 
-The proposed architecture is appropriate for an enterprise-oriented POC. The following refinements are required during implementation:
+### Schema-generator placement
 
-1. **Repository path:** the active repository is `/Users/prakashmanasa/Desktop/Learnings/QueryMate-AI-Official`, not the `Spring_AI` path in the original prompt. All future commands and artifacts should use the actual Git root discovered at execution time rather than a hard-coded developer-machine path.
-2. **Version pinning:** select and pin one exact supported DAB 2.x CLI version, container tag/digest, and compatible configuration schema in Phase 4. Do not use `latest` in reproducible builds or deployments.
-3. **Configuration grouping:** DAB supports top-level `data-source-files`, but relationships cannot cross child configuration files. Domain grouping must therefore follow relationship boundaries. If the schema is highly connected, prefer fewer larger native DAB configuration files over a custom merge framework.
-4. **Credential separation:** the runtime DAB account needs only approved data reads. The developer-time schema generator may require catalog visibility; use a separate discovery identity or narrowly grant metadata visibility rather than expanding the runtime account.
-5. **Authentication:** anonymous access and the DAB `Simulator` provider are local-only shortcuts. DEV and later environments must use authenticated identities and explicit roles.
-6. **Limits:** DAB-native pagination and MCP aggregation timeouts should be configured. Any timeout or payload control not supported by the selected DAB version belongs at the hosting/reverse-proxy or database layer and must be verified rather than assumed.
+**The schema generator is a developer utility, not part of DAB or any other application component. It must live outside `querymate-dab`, must not be copied into an application image, and must not run as a production or Docker Compose service.**
 
-## 3. Proposed monorepo structure
+It runs manually or in a developer/CI workflow, reads SQL Server metadata, and writes candidate output to a temporary or ignored location. A developer reviews the output and manually transfers only approved definitions into `querymate-dab/dab-config.json`.
 
-Only this planning document is created now. The following is the intended structure after the relevant implementation phases:
+## 3. Minimal proposed repository structure
+
+This is the target POC structure, not a requirement to create every file immediately:
 
 ```text
 QueryMate-AI-Official/
-|-- .github/
-|   `-- workflows/                    # Optional shared CI/CD
 |-- docs/
 |   `-- querymate-dab-implementation-plan.md
-|-- querymate-ui/                     # Angular; native npm/Angular build
-|   `-- Dockerfile
-|-- querymate-backend/                # Spring Boot/Spring AI; Maven module
-|   `-- Dockerfile
-|-- querymate-dab/                    # All DAB and SQL Server ownership
-|   `-- ...
-|-- pom.xml                            # Aggregates Java modules only
-|-- docker-compose.yml                # Cross-component local orchestration
+|-- querymate-ui/                     # Future Angular application
+|-- querymate-backend/                # Future Spring Boot/Spring AI application
+|-- querymate-dab/
+|   |-- README.md
+|   |-- Dockerfile
+|   |-- dab-config.json
+|   |-- .env.example                  # Placeholders only; never real secrets
+|   `-- database/
+|       |-- 01-schema.sql
+|       |-- 02-seed-data.sql
+|       |-- 03-readonly-security.sql
+|       `-- verify.sql
+|-- schema-generator/                 # Developer utility; not an application
+|   |-- README.md
+|   `-- <small set of source files>   # Exact files depend on chosen language
+|-- docker-compose.yml                # Local SQL Server + DAB when needed
+|-- pom.xml                            # Java modules only
 |-- .gitignore
 `-- README.md
 ```
 
-The root Compose file may orchestrate SQL Server and DAB, but SQL initialization scripts, DAB configuration, DAB container assets, and schema tooling remain owned by `querymate-dab`.
+### Why this is enough for the POC
 
-## 4. Detailed `querymate-dab` structure
+- Four SQL files are easier to understand than separate `ddl`, `data`, `indexes`, `security`, and `verification` folders.
+- One `dab-config.json` is the default. Do not create domain files until its size causes a real maintenance problem.
+- Do not create a top-level automated-test folder now. Keep SQL checks in `verify.sql` and initially use a small documented DAB smoke test.
+- Do not create `src`, `tests`, `queries`, `schemas`, or `samples` subfolders inside the generator unless its implementation actually needs them.
+- Do not add wrapper frameworks, configuration-merging code, or abstractions for possible future scale.
 
-```text
-querymate-dab/
-|-- README.md
-|-- Dockerfile
-|-- .dockerignore
-|-- config/
-|   |-- dab-config.json               # Top-level stable runtime configuration
-|   |-- domains/                      # Approved explicit entity definitions
-|   |   |-- organization.json         # Example only; final groups follow schema/FKs
-|   |   `-- projects.json
-|   `-- environments/
-|       |-- README.md
-|       `-- *.example                 # Non-secret environment templates only
-|-- database/
-|   |-- ddl/                          # Database, schemas, tables, constraints
-|   |-- data/                         # Deterministic dummy/test data
-|   |-- indexes/                      # Non-constraint indexes
-|   |-- security/                     # Logins/users/roles/grants/denies as approved
-|   |-- verification/                 # Read/write-negative and integrity checks
-|   `-- README.md                     # Order, prerequisites, rollback guidance
-|-- tools/
-|   `-- schema-generator/
-|       |-- README.md
-|       |-- src/
-|       |-- tests/
-|       |-- queries/                  # Versioned SQL metadata queries
-|       |-- schemas/                  # Candidate-output schema
-|       `-- samples/                  # Sanitized examples
-|-- generated/
-|   |-- README.md                     # Candidate-only warning and workflow
-|   `-- .gitkeep                      # Final retention policy decided in Phase 6
-|-- tests/
-|   |-- contract/                     # REST/GraphQL/MCP behavior
-|   |-- integration/                  # DAB + SQL Server
-|   |-- security/                     # Negative authorization/write tests
-|   `-- operational/                  # Health, failure, timeout, telemetry tests
-`-- scripts/                           # Thin, documented developer commands only
-```
+If DAB configuration later becomes hard to review, native `data-source-files` may split it into a few logical groups. Before splitting, verify the selected DAB version because relationships cannot cross child configuration files and entity names must remain globally unique.
 
-Names are provisional until the real schema is reviewed. Do not create one child configuration file per table by default. Each relationship-connected group must remain in the same native DAB child file because DAB does not support relationships across child files.
+## 4. Implementation principles
 
-## 5. Cross-cutting rules
+1. **Start with the minimum:** create only the artifact needed by the current phase.
+2. **Keep tests close to behavior:** a verification SQL file and small protocol smoke test are enough initially.
+3. **Do not scaffold the future:** an empty folder or unused abstraction has no POC value.
+4. **Pin versions:** choose one exact supported DAB 2.x CLI/container version instead of `latest`.
+5. **Keep secrets external:** use environment variables or an approved secret store.
+6. **Deny by default:** an entity or role without explicit permission is not exposed.
+7. **Separate generation from approval:** candidate output cannot overwrite runtime configuration.
+8. **Add complexity from evidence:** split files or add infrastructure only when a measured problem justifies it.
 
-### Security baseline
+## 5. Implementation phases
 
-- Deny by default: objects absent from approved configuration are unavailable, and entities have no access without an explicit permission block.
-- Grant DAB only `SELECT` on approved objects, preferably through a dedicated database role. Do not grant `db_datareader` blindly if it would expose excluded schemas/tables.
-- Do not grant DAB DDL, DML, stored-procedure execution, ownership, impersonation, or broad metadata access unless separately reviewed.
-- Disable MCP create, update, delete, and execute tools globally. Do not expose stored procedures as custom MCP tools during the read-only POC.
-- Use explicit field inclusion for sensitive or mixed-sensitivity entities where practical; verify excluded fields through every enabled protocol.
-- Never commit credentials, tokens, certificates, complete connection strings, or real production data.
-- Use synthetic seed data. Logs and test fixtures must not contain sensitive source records.
+### Phase 0 — Confirm inputs
 
-### Configuration and versioning baseline
+**Tasks:** obtain readable table definitions; confirm uncertain types, lengths, nullability, keys, and relationships; identify the exposure approver; confirm the SQL Server version and representative POC questions.
 
-- Record the selected DAB CLI and container versions together and upgrade them through reviewed changes.
-- Reference secrets using DAB-supported environment/secret resolution, not checked-in values.
-- Treat the top-level runtime configuration as stable and reviewed domain/entity files as evolving configuration.
-- Validate the complete resolved configuration for every target environment. Environment variants are alternatives, not implicit merged overlays.
-- Keep generated candidates visibly separate from approved configuration.
+**Deliverables:** confirmed inputs, genuine open questions, and named data/security approver.
 
-### Definition of done for every phase
+**Acceptance criteria:** no schema detail is silently guessed; unknowns have an owner; initial scope is agreed.
 
-A phase is complete only when its deliverables are committed, automated checks pass where applicable, manual evidence is recorded for non-automatable checks, security acceptance criteria pass, and documentation identifies any remaining limitation. Later phases must not silently waive failed criteria from an earlier phase.
+**Security/testing:** classify obviously sensitive fields before creating synthetic seed data.
 
-## 6. Implementation phases
-
-### Phase 0 — Confirm inputs, conventions, and architecture baseline
-
-**Objective:** remove avoidable ambiguity before implementation begins.
-
-**Tasks**
-
-- Confirm the repository root, default branch, pull-request policy, CI platform, naming conventions, and ownership/reviewers.
-- Obtain authoritative table definitions or legible screenshots, expected relationships, representative query scenarios, and a data-classification owner.
-- Record supported local/DEV SQL Server editions and versions, host platforms, and container constraints.
-- Create an architecture decision record for explicit entities, read-only defense in depth, protocol choices, and candidate-only generation.
-- Create a decision log for DAB version pinning and supported environments.
-
-**Deliverables:** input inventory, assumptions/decision log, architecture decision record, and initial traceability matrix from requirements to phases/tests.
-
-**Acceptance criteria**
-
-- Every supplied table/column is traceable to an authoritative input or explicitly marked unknown.
-- Owners exist for data classification, SQL access, security approval, and DAB configuration review.
-- No schema is inferred from unreadable screenshots without confirmation.
-
-**Security and testing:** define the classification vocabulary and threat-model scope; verify secret scanning and branch protection expectations before secrets or configs exist.
-
-**Dependencies:** none. Blocks Phases 1, 2, 4, and 6.
+**Dependencies:** none. Phase 1 waits for adequate schema input.
 
 ### Phase 1 — Create the SQL Server POC schema
 
-**Objective:** translate approved schema inputs into repeatable SQL Server scripts without yet exposing data through DAB.
+**Tasks**
+
+- Add tables, columns, types, PKs, FKs, constraints, and justified indexes to `01-schema.sql`.
+- Add deterministic synthetic data to `02-seed-data.sql`.
+- Document execution order in `querymate-dab/README.md`.
+- Keep files readable; split only if size later becomes a real problem.
+
+**Deliverables:** the two SQL files and short setup instructions.
+
+**Acceptance criteria:** scripts build a clean database; seed data loads with constraints enabled; representative joins return expected rows.
+
+**Security/testing:** no copied production data, credentials, or unnecessary sensitive columns. Test PK, FK, nullability, unique, and check constraints.
+
+**Dependencies:** Phase 0.
+
+### Phase 2 — Create SQL Server read-only security
 
 **Tasks**
 
-- Model database schemas, tables, columns, SQL Server types, nullability, defaults, checks, PKs, FKs, unique constraints, and required indexes.
-- Resolve ambiguous types, lengths, precision/scale, temporal behavior, Unicode needs, identity/sequence behavior, and delete/update FK actions with the schema owner.
-- Split ordered, rerunnable scripts under `database/ddl`, `database/indexes`, and `database/data`.
-- Create deterministic, synthetic seed data covering relationship and boundary cases; never transcribe real sensitive values from screenshots.
-- Define clean-database setup and developer reset procedures. Destructive reset must be explicit and local-only.
+- Create a dedicated DAB login/user and role in `03-readonly-security.sql`.
+- Grant only required `SELECT` access. Avoid broad roles if they expose unwanted objects.
+- Keep passwords outside SQL and Git.
+- Add checks to `verify.sql` proving reads succeed and DML, DDL, and procedure execution fail.
 
-**Deliverables:** versioned DDL, constraints, indexes, seed scripts, execution-order documentation, and schema diagram or catalog summary.
+**Deliverables:** read-only security SQL and verification SQL.
 
-**Acceptance criteria**
+**Acceptance criteria:** approved reads succeed; writes, DDL, execution, and unapproved-object reads fail using the real DAB identity.
 
-- A clean supported SQL Server instance can be built reproducibly from scripts.
-- All scripts fail clearly on invalid prerequisites and produce the documented object set.
-- PK/FK/check/unique constraints work; seed rows load without disabling integrity checks.
-- Row counts and representative joins match expected fixtures.
+**Security/testing:** do not grant `db_owner`, `db_ddladmin`, or `db_datawriter`. The generator may later use a separate metadata-only identity.
 
-**Security and testing:** avoid production data; set explicit database/schema ownership; test script execution from least-privileged deployment context where practical; scan scripts for embedded credentials and sensitive fixtures.
+**Dependencies:** Phase 1.
 
-**Dependencies:** Phase 0 and approved schema input. Enables Phases 2, 3, and 6.
+### Phase 3 — Review schema and exposure scope
 
-### Phase 2 — Create read-only SQL Server security
+**Tasks:** check keys, relationships, constraints, nullability, and useful indexes; mark every table/field expose, exclude, or needs-decision; flag missing FKs; record sensitive and internal-only data.
 
-**Objective:** ensure a database compromise through DAB cannot become a write path.
+**Deliverables:** concise schema/exposure review table.
 
-**Tasks**
+**Acceptance criteria:** every in-scope table/field has a decision; relationships are backed by FKs or clearly marked for review.
 
-- Define a dedicated login/user strategy for local POC and a future managed/enterprise identity strategy.
-- Create a dedicated database role granting `SELECT` only on individually approved schemas/objects; prefer grants narrow enough to exclude sensitive objects.
-- Create a separate schema-discovery identity if metadata visibility exceeds runtime needs.
-- Keep passwords in local environment/secret stores and provide only non-secret templates.
-- Add verification scripts for allowed reads and forbidden `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `EXECUTE`, `ALTER`, `CREATE`, `DROP`, ownership changes, and cross-database access.
+**Security/testing:** consider indirect sensitivity such as salary, notes, identifiers, audit data, and aggregate inference.
 
-**Deliverables:** security scripts, grant matrix, credential-handling guide, and automated positive/negative verification suite.
+**Dependencies:** Phase 1. Informs Phases 6–10.
 
-**Acceptance criteria**
-
-- The DAB identity can select only approved objects.
-- Every tested write, DDL, procedure execution, and unapproved-object read fails.
-- The DAB identity is not a member of broad built-in roles such as `db_owner`, `db_ddladmin`, or `db_datawriter`.
-- Credential rotation requires configuration/secret changes, not source changes.
-
-**Security and testing:** capture error codes rather than merely expecting nonzero output; run tests using the actual DAB credential; ensure test cleanup does not require granting extra rights to DAB.
-
-**Dependencies:** Phase 1. Required by Phases 4, 10, and 13.
-
-### Phase 3 — Validate and classify the database schema
-
-**Objective:** verify that the database model is safe and usable before API design.
+### Phase 4 — Set up DAB runtime
 
 **Tasks**
 
-- Review PK coverage, composite keys, FKs, cardinality, nullability, uniqueness, checks, default constraints, index selectivity, and likely query paths.
-- Identify missing or suspicious relationships; never invent business relationships merely because column names match.
-- Classify every table and column: approved, conditional/restricted, internal-only, or prohibited.
-- Identify tables/views lacking stable keys, high-cardinality/large-object columns, audit/history tables, and fields likely to leak secrets or personal data.
-- Produce a review checklist and issue register; route undocumented business relationships to the data owner.
+- Pin one supported DAB 2.x CLI and container version.
+- Create minimal `dab-config.json`, Dockerfile, `.env.example`, and run instructions.
+- Read the SQL connection string from an environment variable.
+- Add SQL Server and DAB to Compose only if it improves the local workflow.
+- Run `dab validate`, start DAB independently, and check `/health`.
 
-**Deliverables:** signed schema-review checklist, classification matrix, relationship map, exposure denylist/allowlist proposal, and remediation backlog.
+**Deliverables:** minimal runnable DAB files and README commands.
 
-**Acceptance criteria**
+**Acceptance criteria:** DAB runs without Spring Boot; validation passes; health reflects database availability; no secret is committed or included in the image.
 
-- Every candidate table and column has an owner and exposure classification.
-- Every relationship is backed by an FK or explicitly marked for manual review.
-- Blocking integrity/key issues are resolved before entity generation; nonblocking issues have owners and rationale.
-- Expected query patterns have supporting indexes or a recorded follow-up.
+**Security/testing:** connect with the Phase 2 account, not an administrator account; bind local ports conservatively.
 
-**Security and testing:** validate classifications with security/data owners; include indirect inference risks (salary, identifiers, notes, audit data), not just obvious names such as `ssn`.
+**Dependencies:** Phases 1 and 2.
 
-**Dependencies:** Phase 1; informs Phases 6–10.
-
-### Phase 4 — Set up the independently runnable DAB runtime
-
-**Objective:** establish a reproducible DAB 2.x developer/runtime foundation connected with the read-only SQL identity.
+### Phase 5 — Configure the stable DAB foundation
 
 **Tasks**
 
-- Select an exact supported DAB 2.x release; pin CLI/tool manifest, container tag (and digest where supported), and compatible configuration schema.
-- Add `querymate-dab/Dockerfile`, `.dockerignore`, minimal config scaffold, and non-secret environment templates.
-- Connect through an environment-resolved read-only connection string with appropriate encryption/certificate settings per environment.
-- Add DAB and SQL Server services to root Docker Compose without coupling them to Spring Boot.
-- Document CLI and container startup, networking, readiness order, configuration validation, and troubleshooting.
-- Run `dab validate` and verify the `/health` endpoint against SQL Server.
+- Configure authentication, GraphQL, MCP, and REST only if REST has a concrete use.
+- Configure pagination/result limits, safe errors, health, logging, and supported OpenTelemetry.
+- Enable MCP entity description, reads, and aggregation; disable create, update, delete, and execute.
+- Set the MCP aggregation timeout and document any necessary host/database limit.
 
-**Deliverables:** pinned runtime decision, Dockerfile, Compose integration, config scaffold, environment template, and runbook.
+**Deliverables:** stable runtime settings in `dab-config.json` and a short settings table.
 
-**Acceptance criteria**
+**Acceptance criteria:** only intended protocols/tools are available; large or malformed requests are constrained; shared environments cannot silently use local anonymous/simulator settings.
 
-- DAB starts independently by CLI and container using documented commands.
-- `dab validate` succeeds against the selected schema/database.
-- `/health` returns healthy only when required data sources are responsive.
-- Startup fails safely and diagnostically with a missing secret or unavailable database.
-- No secret is present in image layers, Git, command examples, or logs.
+**Security/testing:** verify disabled tools/endpoints, authentication failures, page limits, timeouts, safe errors, and log redaction.
 
-**Security and testing:** run the container as non-root where supported, minimize image contents, scan the image, restrict published ports to local interfaces in POC, and test with the Phase 2 identity—not `sa`.
+**Dependencies:** Phase 4.
 
-**Dependencies:** Phases 0–2. Enables runtime validation in later phases.
-
-### Phase 5 — Establish stable DAB runtime configuration
-
-**Objective:** separate platform behavior from evolving entity definitions.
+### Phase 6 — Build the external schema generator
 
 **Tasks**
 
-- Configure authentication provider, role model, REST/GraphQL/MCP enablement, host mode, CORS, pagination defaults/maxima supported by the pinned version, and error detail behavior.
-- Enable health with restricted operational roles outside local POC; set appropriate cache TTL, parallelism, data-source thresholds, and selected entity checks.
-- Configure structured logging and OpenTelemetry endpoint/service metadata through environment settings; prevent payload/record logging.
-- Configure MCP DML tools globally: enable `describe-entities`, `read-records`, and `aggregate-records`; disable `create-record`, `update-record`, `delete-record`, and `execute-entity`.
-- Set aggregation query timeout. Verify other timeout/body-size/rate controls in the pinned DAB version; place unsupported controls at SQL Server, reverse proxy, or hosting platform.
-- Decide whether REST adds a justified operational/user use case. Disable it if not required.
-- Document environment variants without secret duplication or an unverified merge assumption.
+- Implement a small developer command in root-level `schema-generator` using a team-supported language.
+- Read its connection string from an environment variable.
+- Query SQL Server metadata for schemas, tables, columns, types, nullability, PKs, FKs, unique constraints, and useful indexes.
+- Produce deterministic candidate JSON or Markdown containing metadata only, not row data.
+- Warn about keyless objects, unsupported types, composite keys, and relationships missing constraints.
+- Write output to a temporary/ignored path and require human review.
 
-**Deliverables:** reviewed top-level config, environment matrix, role matrix, limits/timeouts table, telemetry/logging policy, and configuration tests.
+**Deliverables:** generator source, one README, an example only if useful, and a basic repeatability check.
 
-**Acceptance criteria**
+**Acceptance criteria:** unchanged schemas produce equivalent output; PK/FK direction is correct; failures are clear; the utility cannot overwrite `dab-config.json`.
 
-- Runtime settings remain stable when a new approved entity is added.
-- Only intentionally enabled protocols and MCP tools are discoverable.
-- Page/aggregation limits constrain large requests, and malformed requests fail safely.
-- Production-like environments do not use anonymous or simulator authentication.
-- Configuration changes are validated by the pinned CLI.
+**Security/testing:** use a separate metadata-only identity if needed; never log its connection string; never include the utility in application builds, images, or runtime services.
 
-**Security and testing:** test CORS allowlists, authentication failures, role selection, safe error responses, disabled endpoints/tools, excessive results, malformed filters, and telemetry redaction.
-
-**Dependencies:** Phase 4; supports Phases 9–15.
-
-### Phase 6 — Implement the schema discovery/candidate generator
-
-**Objective:** automate metadata collection without automating approval or publication.
-
-**Tasks**
-
-- Choose the smallest maintainable implementation stack already supported by the team; document its runtime and dependency policy.
-- Accept a connection via secret/environment reference plus optional schema/table allowlists; never accept or emit credentials in output.
-- Query SQL Server catalogs including `sys.schemas`, `sys.tables`, `sys.columns`, `sys.types`, `sys.key_constraints`, `sys.indexes`, `sys.index_columns`, `sys.foreign_keys`, and `sys.foreign_key_columns`.
-- Capture schemas, tables, columns, native types, lengths/precision/scale, nullability, defaults where useful, PK/unique keys, FKs, and review-relevant indexes.
-- Define a deterministic, versioned intermediate candidate schema, canonical ordering, source database fingerprint, generation timestamp kept outside semantic comparison, and tool version.
-- Add `--check`/diff behavior that reports schema drift without writing approved config.
-- Produce warnings for keyless objects, unsupported types, composite relationships, untrusted/disabled FKs, ambiguous names, and metadata access failures.
-- Ensure the output path is candidate-only and the tool has no code path that overwrites `config/domains`.
-
-**Deliverables:** generator source, metadata queries, candidate JSON Schema (or equivalent), CLI contract, sanitized samples, tests, and usage/security documentation.
-
-**Acceptance criteria**
-
-- Repeated runs against unchanged metadata are semantically identical.
-- Unit tests cover mapping/naming/error behavior; integration tests cover representative SQL Server features.
-- Composite keys and FKs retain column order and direction correctly.
-- Partial discovery failures exit nonzero and do not masquerade as a complete candidate set.
-- Approved configuration cannot be overwritten by normal generator operation.
-
-**Security and testing:** use a separate least-privileged metadata identity; sanitize logs; test hostile/unusual identifiers and output escaping; perform dependency and secret scans.
-
-**Dependencies:** Phases 1 and 3; the runtime itself is not required. Enables Phase 7.
+**Dependencies:** Phases 1 and 3. It does not depend on DAB runtime.
 
 ### Phase 7 — Generate candidate entities and relationships
 
-**Objective:** convert normalized metadata into reviewable DAB-shaped candidates without granting exposure.
+**Tasks:** generate candidate names, qualified sources, fields, keys, FK relationships, and relationship names; mark descriptions/exposure/permissions for review; report schema changes; never infer joins or publish output to DAB.
 
-**Tasks**
+**Deliverables:** candidate output and warnings.
 
-- Map each candidate to entity name, fully qualified source, source type, fields, type/nullability metadata, PK/key fields, and FK-derived relationships.
-- Generate deterministic candidate relationship names with collision warnings; do not infer relationships without constraints.
-- Add review placeholders for descriptions, exposure status, field classifications, permissions, and domain assignment.
-- Show changed/added/removed database objects relative to the prior candidate snapshot.
-- Validate candidate documents against their own schema; optionally check their structural compatibility with the pinned DAB schema without turning them into runtime config.
+**Acceptance criteria:** in-scope metadata is accurate; collisions and ambiguity are visible; generated content is not runtime-accessible.
 
-**Deliverables:** candidate entity set, relationship report, drift report, warnings report, and candidate validation results.
+**Security/testing:** output contains no credentials or row data and is treated as potentially sensitive schema information.
 
-**Acceptance criteria**
+**Dependencies:** Phase 6.
 
-- Candidate output accounts for all in-scope discovered tables and columns.
-- PKs/FKs match SQL metadata exactly; unsupported/ambiguous cases are warnings, not fabricated configuration.
-- Naming is repeatable and collisions are explicit.
-- No candidate is reachable through the running DAB instance.
+### Phase 8 — Manually approve entities and fields
 
-**Security and testing:** candidate output is treated as potentially sensitive metadata; confirm it contains no values or connection details; test exclusion/allowlist inputs and prohibited-schema handling.
+**Tasks:** decide expose/reject for each table and field; confirm names, descriptions, relationships, roles, and protocols; obtain required approval; manually place only approved definitions in `dab-config.json`.
 
-**Dependencies:** Phase 6 and current Phase 3 classifications. Enables Phase 8.
+**Deliverables:** approved entity/field list and reviewed DAB definitions.
 
-### Phase 8 — Perform manual entity and security review
+**Acceptance criteria:** nothing is implicitly exposed; every entity has a purpose and read-only permission; excluded items remain absent.
 
-**Objective:** turn candidates into explicitly approved exposure decisions.
+**Security/testing:** consider inference through filters, aggregates, and relationships.
 
-**Tasks**
+**Dependencies:** Phases 3 and 7.
 
-- For every table, decide expose/reject/defer, owner, domain, public entity name, and purpose/description.
-- For every field, decide include/exclude, sensitivity, alias where supported and helpful, and field description.
-- Review every FK-derived relationship, cardinality, naming, and navigation requirement.
-- Assign roles/actions/policies and decide protocol enablement per entity.
-- Require data-owner and security approval for conditional fields; use four-eyes review for all approved config.
-- Record rejected objects so future regeneration does not repeatedly reopen settled decisions without schema/policy change.
+### Phase 9 — Keep configuration readable
 
-**Deliverables:** signed exposure matrix, approved entity specifications, approved relationship map, permission matrix, and rejection/defer register.
+**Tasks:** start with one `dab-config.json`; use consistent ordering; split into a few native child files only if needed; keep related entities together because relationships cannot cross files.
 
-**Acceptance criteria**
+**Deliverables:** readable approved config and, only when necessary, a documented native multi-file layout.
 
-- No entity or field remains implicitly approved.
-- Every exposed item has a business purpose and description suitable for tool/schema discovery.
-- Prohibited fields/tables are excluded; conditional exposure has explicit policy and owner approval.
-- Every permission is read-only and mapped to a defined role.
+**Acceptance criteria:** `dab validate` passes; names are unique; relationships resolve; no custom merge framework exists without demonstrated need.
 
-**Security and testing:** conduct privacy/security review and abuse-case walkthroughs, including inference through aggregates, relationships, filters, and error messages.
+**Security/testing:** compare config to the approved list so candidate/excluded entities cannot slip in.
 
-**Dependencies:** Phases 3 and 7. Enables Phases 9 and 10.
+**Dependencies:** Phases 5 and 8.
 
-### Phase 9 — Organize approved entity configuration
+### Phase 10 — Enforce DAB read-only permissions
 
-**Objective:** create readable native DAB configuration for 20–30+ evolving tables.
+**Tasks:** configure explicit `read` actions per role, field includes/excludes, confirmed row policies if needed, and per-entity protocol enablement.
 
-**Tasks**
+**Deliverables:** DAB permissions and concise permission matrix.
 
-- Build a relationship graph and identify connected components/business domains.
-- Group strongly related entities into native child data-source files referenced by the top-level `data-source-files` setting.
-- Keep both ends of every configured relationship in the same child file; entity names must be globally unique.
-- Keep runtime settings only in the top-level file because child runtime settings are not used.
-- Prefer a small number of coherent files. If cross-domain relationships create one large connected set, accept a larger file rather than introducing a custom merger.
-- Document naming, ordering, ownership, review, and schema-drift update conventions.
+**Acceptance criteria:** roles see only approved entities/fields/rows; no DAB write/execute action exists; SQL negative tests still pass.
 
-**Deliverables:** approved domain configs, top-level references, configuration ownership map, and maintenance guide.
+**Security/testing:** test invalid identity, role selection, excluded-field selection/filtering, nested access, and row boundaries.
 
-**Acceptance criteria**
+**Dependencies:** Phases 2, 8, and 9.
 
-- Full configuration passes `dab validate` against the database.
-- Every relationship target resolves within its child file.
-- No globally duplicated entity name or unapproved candidate appears.
-- Adding an unrelated entity does not require redesigning stable runtime settings.
+### Phase 11 — Validate MCP
 
-**Security and testing:** diff generated candidates against approved config to detect accidental additions; require security review for domain-file changes; verify excluded objects remain absent.
+**Tasks:** test description, read, filter, pagination, aggregation, grouping, timeouts, permissions, and field exclusions; document that MCP does not provide arbitrary SQL or automatic joins.
 
-**Dependencies:** Phases 5 and 8. Enables Phases 10–12.
+**Deliverables:** small smoke-test script or documented commands/results.
 
-### Phase 10 — Configure DAB read-only authorization
+**Acceptance criteria:** only approved read tools/entities/fields appear; write/execute tools are absent; limits and permissions work.
 
-**Objective:** make DAB itself a second enforced read-only boundary.
-
-**Tasks**
-
-- Add explicit `read` permissions per entity and role; never use wildcard action permissions.
-- Configure field include/exclude rules from the approved exposure matrix.
-- Configure database/request policies only for reviewed row restrictions; document SQL Server RLS as a future/conditional deeper control.
-- Disable an entity on protocols where it is not needed.
-- Verify role inheritance/effective-role behavior for the pinned version; do not assume permissions from multiple roles combine.
-- Align DAB roles with future JWT/enterprise identity claims without hard-coding a specific provider prematurely.
-
-**Deliverables:** approved authorization config, role-to-entity/field matrix, row-policy extension design, and authorization test suite.
-
-**Acceptance criteria**
-
-- Anonymous access exists only if explicitly accepted for local POC and cannot be enabled accidentally in DEV/production profiles.
-- Each role reads exactly its approved entities/fields/rows and no others.
-- DAB exposes no create/update/delete/execute action even if the database were misconfigured.
-- SQL read-only negative tests from Phase 2 still pass.
-
-**Security and testing:** test direct field selection, nested GraphQL selection, filters/order clauses on excluded fields, MCP descriptions, role spoofing, missing/invalid tokens, and policy boundary rows.
-
-**Dependencies:** Phases 2, 8, and 9. Enables protocol/security testing.
-
-### Phase 11 — Configure and validate MCP
-
-**Objective:** prove safe, structured AI-facing read and aggregation operations.
-
-**Tasks**
-
-- Enable MCP transport/settings supported by the pinned DAB release.
-- Confirm only `describe_entities`, `read_records`, and `aggregate_records` are registered globally and only for approved entities.
-- Test descriptions, structured filters, sorting if supported, pagination/continuation, aggregation (`count`, `sum`, `avg`, `min`, `max` as applicable), grouping, `having`, and aggregation timeout.
-- Test roles, row policies, field restrictions, malformed calls, unavailable SQL Server, and result limits.
-- Document that MCP calls operate on configured entities and do not provide arbitrary joins or arbitrary SQL.
-- Document when callers should use GraphQL for reviewed relationship traversal.
-
-**Deliverables:** MCP config, protocol contract/examples, automated integration/security tests, limitation guide, and test evidence.
-
-**Acceptance criteria**
-
-- Tool discovery shows only approved tools, entities, operations, and fields for the effective role.
-- Write and execute tools are absent, not merely expected to fail.
-- Reads/aggregations honor pagination, policies, field restrictions, and timeouts.
-- No parameter can escape the structured DAB operation into arbitrary SQL.
-
-**Security and testing:** include prompt/tool misuse scenarios, injection-like filter strings, oversized calls, inference-sensitive aggregates, authentication failures, and redacted observability checks.
+**Security/testing:** include malformed, oversized, injection-like, unauthorized, and unavailable-database cases.
 
 **Dependencies:** Phases 5, 9, and 10.
 
-### Phase 12 — Configure and validate GraphQL relationships
+### Phase 12 — Validate GraphQL relationships
 
-**Objective:** prove relationship-heavy, nested read scenarios before backend integration.
+**Tasks:** test applicable relationship types, nested reads, filters, sorting, pagination, null relationships, and invalid definitions; measure representative queries and add indexes/views only when evidence supports them.
 
-**Tasks**
+**Deliverables:** documented GraphQL queries/results and confirmed limitations.
 
-- Configure approved one-to-one, one-to-many, many-to-one, and justified many-to-many relationships.
-- Test nested reads, multiple nesting levels, filtering, sorting, pagination, aggregation where useful, null relationships, and composite keys.
-- Add negative tests for missing targets, reversed mappings, incompatible fields, cross-file relationships, cyclic/deep queries, and unauthorized nested fields.
-- Define representative business queries and measure generated request/database performance.
-- Consider a reviewed database view only when DAB entity/relationship modeling cannot express a proven read use case; do not shift joins into Spring Boot by default.
+**Acceptance criteria:** approved relationships return correct synthetic data; nested permissions work; invalid relationships fail validation; results are bounded.
 
-**Deliverables:** relationship config, GraphQL contract/examples, automated tests, performance findings, and documented limitations.
+**Security/testing:** test unauthorized traversal, excluded fields, and expensive query shapes.
 
-**Acceptance criteria**
+**Dependencies:** Phases 9 and 10. May run alongside Phase 11.
 
-- All approved relationship scenarios return correct fixtures and obey authorization at every nested entity.
-- Invalid relationships fail validation before deployment.
-- Page/result controls prevent unbounded traversal.
-- Representative queries meet provisional POC latency/resource targets or have documented remediation.
+### Phase 13 — Perform the security check
 
-**Security and testing:** test unauthorized traversal, excluded-field introspection/selection, expensive query shapes, errors, and aggregation inference boundaries.
+**Tasks:** run direct SQL write/DDL failures; test writes through every enabled protocol; try rejected data through reads, filters, ordering, relationships, and aggregates; scan Git, image, logs, and traces for secrets; confirm request limits.
 
-**Dependencies:** Phases 9 and 10; can run in parallel with Phase 11 once prerequisites pass.
+**Deliverables:** concise pass/fail security checklist and remediation items.
 
-### Phase 13 — Execute defense-in-depth security testing
+**Acceptance criteria:** writes fail closed; rejected data is inaccessible; no high-severity finding or secret leak remains.
 
-**Objective:** demonstrate with evidence that no supported path bypasses read-only and exposure controls.
+**Security/testing:** use the real DAB role/configuration rather than mocks.
 
-**Tasks**
+**Dependencies:** Phases 10–12.
 
-- Build a security matrix across direct SQL, REST if enabled, GraphQL, MCP, health, and administrative/diagnostic surfaces.
-- Prove SQL `INSERT`/`UPDATE`/`DELETE`/DDL/execute fail under the DAB identity.
-- Prove DAB mutations fail or are absent across all enabled protocols.
-- Prove sensitive fields, rejected entities, and unauthorized rows/roles are inaccessible through selection, filtering, ordering, aggregation, relationships, introspection, and errors.
-- Test excessive data requests, malformed inputs, injection payloads, brute-force/rate scenarios, secret leakage, image contents, logs, traces, and repository history.
-- Threat-model the DAB trust boundary and track findings by severity and owner.
+### Phase 14 — Validate health and observability
 
-**Deliverables:** threat model, automated security suite, evidence report, vulnerability/remediation register, and security sign-off.
+**Tasks:** verify structured logs, `/health`, durations, and OpenTelemetry where enabled; test slow/down SQL, invalid config, authentication failures, and timeouts; write troubleshooting notes.
 
-**Acceptance criteria**
+**Deliverables:** working health/telemetry settings and troubleshooting guidance.
 
-- All required negative cases fail closed with safe responses.
-- No critical/high finding remains open for POC handover.
-- No secret or sensitive fixture exists in Git history, images, logs, traces, or build artifacts.
-- Limits constrain abusive requests and recovery is documented.
+**Acceptance criteria:** failures are distinguishable without logging records/secrets; telemetry failure does not stop DAB.
 
-**Security and testing:** this phase is the consolidated security gate; tests must run with real role configurations and the actual runtime SQL credential.
+**Security/testing:** restrict detailed health outside local POC and verify redaction with sentinel values.
 
-**Dependencies:** Phases 10–12. Blocks Phase 16.
+**Dependencies:** Phases 4, 5, 11, and 12.
 
-### Phase 14 — Validate observability and operations
+### Phase 15 — Add proportionate CI validation
 
-**Objective:** make failures diagnosable without exposing data.
+**Tasks:** begin with DAB validation, secret scanning, and Docker build; add SQL verification and protocol smoke tests when an ephemeral SQL Server is practical; do not build deployment infrastructure before selecting a target environment.
 
-**Tasks**
+**Deliverables:** small CI workflow containing currently valuable checks.
 
-- Configure structured logs with environment, service version, request/correlation context, outcome, and duration where supported.
-- Export OpenTelemetry traces and metrics for REST, GraphQL, MCP, database calls, middleware, errors, request duration, and active requests to a local/test collector.
-- Configure `/health` roles, caching, parallelism, data-source thresholds, and selected entity probes so health checks remain bounded.
-- Exercise database unavailable/slow/authentication failure, DAB invalid config/startup failure, telemetry backend unavailable, timeout, and graceful shutdown scenarios.
-- Define dashboards/alerts and operational runbooks for DEV/production evolution.
+**Acceptance criteria:** selected checks run repeatably with pinned versions and no production credentials/data; invalid config or failed security checks block the build.
 
-**Deliverables:** telemetry config, local validation setup, dashboard/alert specification, failure runbooks, and operational test evidence.
+**Security/testing:** use short-lived/minimal CI credentials and scan images/config changes.
 
-**Acceptance criteria**
+**Dependencies:** checks are added incrementally; the complete POC gate follows Phases 4–14.
 
-- Operators can distinguish startup/config, authentication, SQL connectivity, query timeout, and caller errors.
-- Traces correlate a request/tool call to its database operation without recording result data or secrets.
-- Health is useful and bounded; telemetry-backend failure does not break data service behavior.
-- Shutdown allows a reasonable telemetry flush window.
+### Phase 16 — Complete DAB and hand over
 
-**Security and testing:** verify log/trace redaction with canary secrets and sensitive fixture fields; restrict detailed health/diagnostics to operational roles outside local POC.
+**Tasks:** run the POC checklist cleanly; document MCP/GraphQL contracts, authentication, limits, errors, and limitations; give setup/troubleshooting instructions to the backend team.
 
-**Dependencies:** Phases 4, 5, 11, and 12. Blocks Phase 16.
+**Deliverables:** tested DAB release candidate, examples, readiness checklist, and known issues.
 
-### Phase 15 — Add CI/CD and configuration validation
+**Acceptance criteria:** DAB works without Spring Boot; approved reads pass; writes and unapproved access fail; health and validation pass; backend needs no SQL credential or arbitrary-SQL path.
 
-**Objective:** reject invalid, unsafe, or unreproducible changes before deployment.
+**Security/testing:** rerun secret scan, least-privilege checks, protocol authorization, and representative load checks.
 
-**Tasks**
+**Dependencies:** all earlier phases; Phases 13–15 are final gates.
 
-- Add fast checks for JSON/schema formatting, candidate schema, documentation links, generated drift, and secret scanning.
-- Run the pinned `dab validate` against an ephemeral representative SQL Server because validation includes connectivity/entity metadata checks.
-- Build and scan the pinned DAB image; verify its effective user, exposed ports, and absence of secrets.
-- Run SQL migrations/setup, integrity checks, DAB contract tests, and security negative tests in an isolated environment.
-- Require reviewed approval for changes under approved config/security paths; publish test evidence and version metadata.
-- Define promotion using immutable images plus external environment secrets/configuration; include rollback and compatibility checks.
-
-**Deliverables:** CI workflow, ephemeral integration environment, quality gates, artifact/version manifest, promotion/rollback guide, and ownership rules.
-
-**Acceptance criteria**
-
-- Invalid config, missing entity source, broken relationship, failed security test, secret finding, vulnerable image above policy, or failed image build blocks promotion.
-- CI uses no production credentials/data and destroys isolated resources after the run.
-- Rebuilding the same revision uses the same pinned DAB/tool versions.
-- Approved configuration cannot be replaced directly by unreviewed generator output.
-
-**Security and testing:** use short-lived CI identities/secrets, minimal permissions, protected environments, signed/provenanced artifacts when available, and retained audit evidence.
-
-**Dependencies:** automate each earlier phase as its checks mature; final gate depends on Phases 4–14.
-
-### Phase 16 — Complete DAB layer and hand over to backend integration
-
-**Objective:** establish a trusted, versioned contract for the future Spring AI/backend work.
-
-**Tasks**
-
-- Execute the complete acceptance suite from a clean environment.
-- Publish endpoint/tool/schema contracts, role/auth expectations, examples, limits, timeout behavior, error model, and known limitations.
-- Record entity/config version and compatibility/change policy for backend consumers.
-- Provide local/DEV runbooks, dependency/startup order, operational ownership, and escalation paths.
-- Hold architecture, data-owner, security, operations, and backend-consumer readiness review.
-
-**Deliverables:** release candidate, signed readiness checklist, API/MCP/GraphQL contract pack, test/security evidence, operations handover, and deferred-work backlog.
-
-**Acceptance criteria**
-
-- DAB works independently of Spring Boot from clean setup through representative queries.
-- Required MCP and GraphQL reads pass; writes and unapproved access fail at both DAB and SQL layers.
-- Health, telemetry, failure handling, limits, and CI gates pass.
-- Backend integration requires only the documented authenticated contract—no database credential and no arbitrary SQL path.
-- Required stakeholders approve handover and all residual risks are explicitly accepted.
-
-**Security and testing:** rerun secret/history scan, dependency/image scan, least-privilege verification, protocol authorization suite, and representative load/resilience tests.
-
-**Dependencies:** all prior phases, with Phases 13–15 as hard gates.
-
-## 7. Phase dependency and execution summary
+## 6. Dependencies at a glance
 
 ```text
-Phase 0
-  |-- Phase 1 -- Phase 2 ------------------------|
-  |      `------ Phase 3 -- Phase 6 -- Phase 7 -- Phase 8
-  `-------------- Phase 4 -- Phase 5 --------------------|
-                                                         v
-                                                     Phase 9
-                                                         |
-                                                     Phase 10
-                                                      /     \
-                                             Phase 11       Phase 12
-                                                      \     /
-                                              Phase 13 and Phase 14
-                                                         |
-                                                     Phase 15
-                                                         |
-                                                     Phase 16
+Phase 0 -> Phase 1 -> Phase 2
+              |        |
+              v        v
+           Phase 3 -> Phase 6 -> Phase 7 -> Phase 8
+              |                              |
+              `-> Phase 4 -> Phase 5 --------+-> Phase 9 -> Phase 10
+                                                              |       |
+                                                              v       v
+                                                        Phase 11   Phase 12
+                                                              \       /
+                                                        Phase 13 and 14
+                                                              |
+                                                          Phase 15
+                                                              |
+                                                          Phase 16
 ```
 
-Phases 11 and 12 can proceed in parallel after Phase 10. CI work in Phase 15 should begin incrementally rather than waiting until the end, but the complete pipeline is a handover gate.
+## 7. Minimal testing approach
 
-## 8. Testing strategy
+The POC does not need a large testing framework or many test folders.
 
-| Layer | Required tests |
+- `database/verify.sql`: schema integrity, allowed reads, and forbidden SQL writes/DDL.
+- One small smoke-test script or documented commands: DAB validation, health, MCP reads/aggregates, and GraphQL relationships.
+- CI: secret scan, DAB validation, Docker build, then smoke tests when feasible.
+- Synthetic sentinel fields/rows make accidental exposure easy to detect.
+
+Add a dedicated test project/folder only when tests become numerous enough that this approach is difficult to maintain.
+
+## 8. Risks and mitigations
+
+| Risk | Mitigation |
 |---|---|
-| SQL schema | Clean build, repeatability, constraints, keys, relationships, indexes, seed integrity, supported SQL Server versions |
-| SQL security | Approved reads succeed; DML, DDL, execute, unapproved objects, cross-database access fail |
-| Generator | Metadata mapping, deterministic output, composite keys/FKs, drift, odd identifiers, partial failure, no config overwrite |
-| DAB config | JSON/schema validation, live metadata validation, environment resolution, relationship integrity, pinned-version compatibility |
-| Authorization | Roles, missing/invalid JWT, entity/field/row restrictions, nested access, introspection/discovery, protocol parity |
-| MCP | Tool discovery, reads, filters, pagination, aggregates/groups, timeout, malformed/oversized calls, writes absent |
-| GraphQL | Relationship cardinalities, nested reads, filters/sort/pagination, authorization, invalid and expensive queries |
-| REST (if enabled) | Projection, filter/sort/page behavior, role/field restrictions, allowed methods, malformed requests |
-| Operations | Health, slow/down SQL, startup/config failure, telemetry export/downstream failure, safe logs, graceful shutdown |
-| Supply chain | Secret/dependency/image scans, pinned/reproducible versions, artifact provenance where available |
+| Screenshots omit schema detail | Confirm unknowns; do not infer silently |
+| DAB SQL account is too broad | Narrow `SELECT` grants and automated failure checks |
+| Candidate output is treated as approved | External generator, temporary output, manual review/copy only |
+| Configuration becomes too large | Improve ordering first; then use a few native child files |
+| DAB behavior changes | Pin/test an exact version and upgrade intentionally |
+| Local anonymous settings reach shared environments | Separate settings and CI checks; require enterprise auth |
+| AI requests too much data | Pagination, result caps, timeouts, and representative tests |
+| Sensitive data leaks indirectly | Field/row restrictions and negative protocol tests |
+| POC becomes overengineered | Do not create unused folders, frameworks, services, or pipelines |
 
-Tests should use synthetic data designed to make authorization leakage obvious—for example, rows owned by different principals and sentinel prohibited fields. Negative tests are first-class acceptance evidence.
+## 9. Acceptable POC shortcuts
 
-## 9. Key risks and mitigations
+- Local SQL Server and synthetic data.
+- Local SQL authentication with secrets outside Git.
+- DAB unauthenticated/simulator mode only in a local, non-shared environment.
+- One DAB config file and four SQL files.
+- Manual approval notes instead of a governance platform.
+- Documented smoke-test commands instead of a full test framework.
+- Local telemetry or structured logs only at first.
+- REST disabled unless a concrete need appears.
 
-| Risk | Impact | Mitigation |
-|---|---|---|
-| Screenshots omit constraints or type detail | Incorrect schema and relationships | Require authoritative confirmation; track unknowns; never silently infer |
-| Runtime account is overprivileged | DAB flaw/misconfiguration can modify or expose data | Object-level `SELECT`, separate discovery identity, automated SQL negative tests |
-| Candidate output is mistaken for approval | Sensitive object becomes exposed | Separate directories/formats, approval status, protected config paths, no overwrite path |
-| Domain files split related entities | Invalid/unavailable relationships | Build relationship graph first; keep targets together; validate live configuration |
-| Floating DAB versions change behavior | Non-reproducible or insecure builds | Pin CLI, schema, image tag/digest; controlled upgrade tests |
-| Anonymous POC settings escape to DEV | Unauthorized access | Environment gates, authenticated DEV profile, CI assertions, no permissive defaults |
-| Large/nested AI-generated requests overload SQL | Availability/cost problem | Pagination/result caps, aggregation timeout, query/index testing, proxy/host limits, monitoring |
-| Sensitive data leaks indirectly | Privacy/security incident | Classification plus inference review; field/row restrictions; aggregate/nested tests; redaction |
-| Missing FKs hide business relationships | Incomplete query capability | Flag for owner review; add approved constraints/views only with clear semantics |
-| Custom configuration tooling grows prematurely | Maintenance burden and drift | Use native DAB multi-file support; accept fewer larger files; revisit only with evidence |
-| DAB feature assumptions are version-specific | Invalid plan/config | Verify pinned-version Microsoft docs/schema during each implementation phase |
-| Health/telemetry exposes internals | Reconnaissance or data leak | Operational roles, bounded probes, safe details, no record/payload logging |
+Read-only security, explicit exposure review, secret handling, and negative tests are not optional shortcuts.
 
-## 10. Acceptable POC shortcuts
+## 10. Before production
 
-The following are acceptable only when documented and prevented from silently becoming production defaults:
+- Add enterprise authentication, role/claim mapping, and approved secret management/workload identity.
+- Add TLS, private networking, ingress/rate/payload controls, and platform hardening.
+- Complete formal data/privacy review and access recertification.
+- Define SQL backup/restore, HA/DR, patching, capacity, and performance plans.
+- Define SLOs, alerts, retention/redaction, and incident runbooks.
+- Add load, soak, recovery, and security tests.
+- Add image/SBOM signing, vulnerability policy, and upgrade/rollback process.
+- Define backward-compatible schema/entity changes and row-level security where required.
 
-- A local SQL Server container or developer instance with synthetic data.
-- SQL authentication for local development when secrets stay outside Git; DEV should test the intended enterprise identity path early.
-- DAB `Unauthenticated` or `Simulator` authentication on loopback-only local environments.
-- A local OpenTelemetry collector and simple trace UI rather than enterprise monitoring.
-- Manual data/security approval recorded in repository documentation before a formal governance workflow exists.
-- Provisional latency/load thresholds based on representative POC queries.
-- REST disabled or minimally enabled until a concrete consumer requires it.
-- One or a few larger entity configuration files when relationship boundaries make finer domain separation invalid.
+## 11. Deferred decisions
 
-Shortcuts may simplify infrastructure, not the read-only controls, explicit exposure review, secret handling, or negative security tests.
+| Decision | Resolve when |
+|---|---|
+| Exact DAB 2.x version | Phase 4 |
+| Generator language | Phase 6, based on team familiarity |
+| Final entity/domain names | After actual schema review |
+| Splitting `dab-config.json` | Only when one file is demonstrably hard to maintain |
+| REST enablement | When a concrete consumer requires it |
+| Enterprise identity provider | Before shared DEV deployment |
+| DAB row policy vs SQL Server RLS | When row requirements are known |
+| Views/read-only procedures | Only after a proven query cannot be modeled acceptably |
+| Hosting platform/full CI/CD | Before production planning |
+| Exact limits and SLOs | After measuring real POC queries |
 
-## 11. Changes required before production
+## 12. Open questions
 
-- Replace local/anonymous authentication with approved enterprise identity/JWT validation, explicit role claims, rotation, and workload identity where possible.
-- Integrate an approved secret manager; eliminate long-lived SQL passwords where supported.
-- Validate network isolation, TLS/certificate trust, private connectivity, ingress/WAF/reverse-proxy controls, rate limits, payload limits, and denial-of-service protections.
-- Establish formal data classification, privacy/legal review, access recertification, segregation of duties, and auditable approvals.
-- Define SQL HA/DR, backups, restore testing, patching, capacity, connection pooling, and performance baselines.
-- Add production SLOs, dashboards, alerting, log retention/redaction/access policies, trace sampling, and incident runbooks.
-- Add load, soak, concurrency, failover, recovery, penetration, and dependency/supply-chain testing.
-- Sign and attest immutable images, generate an SBOM, enforce vulnerability policy, and define upgrade/rollback cadence.
-- Define backward-compatible entity/schema change policy and consumer contract/version management.
-- Evaluate row-level security and database policies against real tenancy/authorization requirements.
-- Reassess whether REST is needed and minimize the exposed surface.
-- Complete environment-specific hardening and production readiness review.
+1. What are the authoritative table definitions, keys, and relationships?
+2. Which SQL Server version must the POC and company DEV support?
+3. Who approves tables and fields for exposure?
+4. Which identity provider and roles will shared DEV use?
+5. Which representative MCP/GraphQL questions define POC success?
 
-## 12. Explicitly deferred decisions
+## 13. Official DAB references
 
-These decisions should not block the plan today, but must be resolved in the named phase:
-
-| Decision | Resolve by | Trigger/input |
-|---|---:|---|
-| Exact DAB 2.x CLI/image/schema version | Phase 4 | Current supported release and organization policy |
-| Final database/table/domain names | Phase 1/3 | Authoritative schema inputs |
-| Schema generator language/runtime | Phase 6 | Team supportability and existing stack |
-| Whether generated candidate metadata is committed or CI-only | Phase 6 | Sensitivity, review workflow, diff value |
-| Final domain-file boundaries | Phase 9 | Actual FK/relationship graph |
-| REST enabled or disabled | Phase 5 | Proven non-AI consumer/operational need |
-| Enterprise identity provider and claim mapping | Before DEV deployment | Organization identity architecture |
-| DAB database policy versus SQL Server RLS | Phase 10 / pre-production | Row-level authorization requirements and threat model |
-| Views/read-only stored procedures | After Phase 12 evidence | A specific query DAB cannot model acceptably |
-| Hosting platform and external gateway controls | Pre-production | Enterprise platform standards and scale |
-| Exact SLOs, rate limits, page sizes, and timeouts | Phase 5 then production review | Data volume and measured workload |
-
-## 13. Open questions
-
-Only the following inputs are genuinely required before their dependent phases can complete:
-
-1. What are the authoritative SQL Server table definitions, keys, relationships, and data classifications behind the forthcoming screenshots?
-2. Which SQL Server edition/version must local development and company DEV support?
-3. Who approves entity/field exposure and conditional sensitive fields?
-4. Which enterprise identity provider, token issuer/audience, and role claims are expected in DEV/production?
-5. What representative MCP/GraphQL questions and provisional data-volume/latency targets define POC success?
-
-## 14. Current official DAB references
-
-Implementation must re-check these references against the pinned release rather than copying examples blindly:
+Verify syntax against the selected DAB version:
 
 - [Data API Builder documentation](https://learn.microsoft.com/en-us/azure/data-api-builder/)
-- [DAB CLI configuration validation](https://learn.microsoft.com/en-us/azure/data-api-builder/command-line/dab-validate)
-- [Multiple data sources and configuration files](https://learn.microsoft.com/en-us/azure/data-api-builder/concept/config/multi-config)
-- [Authorization overview](https://learn.microsoft.com/en-us/azure/data-api-builder/concept/security/authentication-local)
-- [SQL MCP Server overview](https://learn.microsoft.com/en-us/azure/data-api-builder/mcp/overview)
-- [MCP DML tools and aggregation](https://learn.microsoft.com/en-us/azure/data-api-builder/mcp/data-manipulation-language-tools)
-- [GraphQL aggregation](https://learn.microsoft.com/en-us/azure/data-api-builder/how-to/aggregate-data)
+- [DAB configuration validation](https://learn.microsoft.com/en-us/azure/data-api-builder/command-line/dab-validate)
+- [Multiple configuration files](https://learn.microsoft.com/en-us/azure/data-api-builder/concept/config/multi-config)
+- [Authorization](https://learn.microsoft.com/en-us/azure/data-api-builder/concept/security/authentication-local)
+- [SQL MCP Server](https://learn.microsoft.com/en-us/azure/data-api-builder/mcp/overview)
+- [MCP DML tools](https://learn.microsoft.com/en-us/azure/data-api-builder/mcp/data-manipulation-language-tools)
 - [Health checks](https://learn.microsoft.com/en-us/azure/data-api-builder/concept/monitor/health-checks)
 - [OpenTelemetry](https://learn.microsoft.com/en-us/azure/data-api-builder/concept/monitor/open-telemetry)
-- [Run DAB in a container](https://learn.microsoft.com/en-us/azure/data-api-builder/deployment/local-container)
 
-## 15. Recommended first execution checkpoint
+## 14. Recommended start
 
-Begin implementation with Phase 0 only. Its review should approve the actual schema inputs, classification ownership, SQL Server target, DAB version-selection criteria, and representative query scenarios. Then execute Phases 1–3 before defining any approved DAB entity configuration. This order prevents API exposure decisions from being built on guessed schema details.
+Start with Phase 0 and stop until schema questions are answered. Then implement Phases 1–3 with the four simple SQL files. Do not build the generator, DAB entities, extra folders, or CI infrastructure until the preceding phase actually requires them.
