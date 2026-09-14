@@ -4,7 +4,7 @@ This is NOT the final production QueryMate backend. The sole purpose of this POC
 
 1. Spring Boot can connect to my company-hosted OpenAI-compatible GPT-OSS-120B endpoint.
 2. Spring AI can send chat requests to that model.
-3. Spring AI can connect to my already-running MCP server.
+3. Spring AI can connect to my already-running MCP server
 4. MCP tools can be discovered.
 5. GPT-OSS-120B can decide to invoke an MCP tool.
 6. Spring AI can execute the MCP tool and return the tool result to the LLM.
